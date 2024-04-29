@@ -138,6 +138,7 @@ class MLCEmbeddings:  # pylint: disable=too-few-public-methods
         device: Optional[str] = "auto",
         debug_dir: Optional[str] = None,
     ):
+
         self.device = detect_device(device)
         instrument = DefaultDebugInstrument(Path(debug_dir)) if debug_dir else None
         self.mod, self.params, self.metadata = _get_tvm_module(
