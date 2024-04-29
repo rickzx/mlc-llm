@@ -1,9 +1,5 @@
 """
 Implementation for BERT architecture.
-<<<<<<< HEAD
-=======
-TODO: add docstring
->>>>>>> 72403b33 (Support BERT model architecture in SLM)
 """
 
 import dataclasses
@@ -16,10 +12,6 @@ from tvm.relax.frontend.nn import Tensor, op
 
 from mlc_llm import op as op_ext
 from mlc_llm.support import logging
-<<<<<<< HEAD
-=======
-from mlc_llm.support import tensor_parallel as tp
->>>>>>> 72403b33 (Support BERT model architecture in SLM)
 from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
 
