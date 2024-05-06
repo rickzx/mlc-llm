@@ -232,7 +232,7 @@ class BertModel(nn.Module):
         def _attention_mask(mask: te.Tensor, zero, batch_size, seq_len):
             return te.compute(
                 (batch_size, 1, seq_len, seq_len),
-                lambda b, _, i, j: tir.if_then_else(
+                lambda b, _, i, j: tir.Select(
                     tir.any(mask[b, i] == zero, mask[b, j] == zero),
                     tir.min_value(self.dtype),
                     tir.max_value(self.dtype),
@@ -247,13 +247,113 @@ class BertModel(nn.Module):
             args=[attention_mask, tir.IntImm("int32", 0), batch_size, seq_len],
         )
         return self.forward(inputs, attention_mask_2d)
+    
+    def prefill_binary(self, inputs: Tensor, attention_mask: Tensor):
+        def _attention_mask(mask: te.Tensor, zero, batch_size, seq_len):
+            return te.compute(
+                (batch_size, 1, seq_len, seq_len),
+                lambda b, _, i, j: tir.Select(
+                    tir.any(mask[b, i] == zero, mask[b, j] == zero),
+                    tir.min_value(self.dtype),
+                    tir.max_value(self.dtype),
+                ),
+                name="attention_mask_prefill",
+            )
+
+        batch_size, seq_len = inputs.shape
+        attention_mask_2d = op.tensor_expr_op(
+            _attention_mask,
+            name_hint="attention_mask_prefill",
+            args=[attention_mask, tir.IntImm("int32", 0), batch_size, seq_len],
+        )
+        result = self.forward(inputs, attention_mask_2d)  # (batch_size, max_seq_len, hidden_size)
+
+        # Get result[:, 0] > 0
+        def _index_and_binary_quant(result: te.Tensor):
+            b, s, h = result.shape
+            return te.compute(
+                (b, h),
+                lambda b, h: tir.Select(
+                    result[b, 0, h] > 0,
+                    1,
+                    0
+                ),
+                name="index_and_binary_quant",
+            )
+
+        return op.tensor_expr_op(
+            _index_and_binary_quant,
+            name_hint="index_and_binary_quant",
+            args=[result]
+        )
+
 
     def softmax_with_temperature(self, logits: Tensor, temperature: Tensor):
         return op.softmax(logits / op.reshape(temperature, (temperature.shape[0], 1, 1)), axis=-1)
 
+    def quantize_embedding_binary(self, inputs: Tensor):
+        """
+        Equivalent to inputs > 0.
+        """
+        def _quantize_embedding_binary(inputs: te.Tensor):
+            batch_size, hidden_size  = inputs.shape
+            return te.compute(
+                (batch_size, hidden_size),
+                lambda b, h: tir.Select(
+                    inputs[b, h] > 0,
+                    1,
+                    0
+                ),
+                name="quantize_embedding_binary"
+            )
+        quantized_embedding = op.tensor_expr_op(
+            _quantize_embedding_binary,
+            name_hint="quantize_embedding_binary",
+            args=[inputs]
+        )
+
+        return quantized_embedding
+
+    def quantize_embedding_int8(self, inputs: Tensor, range_min: Tensor, range_max: Tensor):
+        """
+        Quantize the model to int8.
+
+        Parameters
+        ----------
+        inputs: nn.Tensor
+            Input embeddings to be quantized, of shape (batch_size, hidden_size)
+        range_min: nn.Tensor
+            Min for each hidden_size, received from calibration embeddings of shape (hidden_size,)
+        range_max: nn.Tensor
+            Max for each hidden_size, received from calibration embeddings of shape (hidden_size,)
+        """
+        def _quantize_embedding_int8(inputs: te.Tensor, range_min: te.Tensor, range_max: te.Tensor):
+            batch_size, hidden_size  = inputs.shape
+            return te.compute(
+                (batch_size, hidden_size),
+                lambda b, h: (inputs[b, h] - range_min[h]) / 
+                    ((range_max[h] - range_min[h]) / 255) - 128,
+                name="quantize_embedding_int8"
+            )
+        quantized_embedding = op.tensor_expr_op(
+            _quantize_embedding_int8,
+            name_hint="quantize_embedding_int8",
+            args=[inputs, range_min, range_max]
+        )
+
+        return quantized_embedding.astype("int8")
+
     def get_default_spec(self):
         mod_spec = {
             "prefill": {
+                "inputs": nn.spec.Tensor(["batch_size", "seq_len"], "int32"),
+                "attention_mask": nn.spec.Tensor(["batch_size", "seq_len"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "prefill_binary": {
                 "inputs": nn.spec.Tensor(["batch_size", "seq_len"], "int32"),
                 "attention_mask": nn.spec.Tensor(["batch_size", "seq_len"], "int32"),
                 "$": {
@@ -269,5 +369,21 @@ class BertModel(nn.Module):
                     "effect_mode": "none",
                 },
             },
+            "quantize_embedding_binary": {
+                "inputs": nn.spec.Tensor(["batch_size", "hidden_size"], dtype="float32"),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+            "quantize_embedding_int8": {
+                "inputs": nn.spec.Tensor(["batch_size", "hidden_size"], dtype="float32"),
+                "range_min": nn.spec.Tensor(["hidden_size"], dtype="float32"),
+                "range_max": nn.spec.Tensor(["hidden_size"], dtype="float32"),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            }
         }
         return nn.spec.ModuleSpec.from_raw(mod_spec, self)

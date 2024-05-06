@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import numpy as np
 import tvm
@@ -147,6 +147,9 @@ class MLCEmbeddings:  # pylint: disable=too-few-public-methods
         self.model_path, _ = _get_model_path(model)
         self.tokenizer = Tokenizer(self.model_path)
         self.prefill_func = self.mod["prefill"]
+        self.prefill_binary_func = self.mod["prefill_binary"]
+        self.quantize_embedding_binary_func = self.mod["quantize_embedding_binary"]
+        self.quantize_embeddings_int8_func = self.mod["quantize_embedding_int8"]
 
     def embed(self, queries: List[str]) -> tvm.runtime.NDArray:
         """
@@ -167,6 +170,76 @@ class MLCEmbeddings:  # pylint: disable=too-few-public-methods
         attention_mask_tvm = tvm.nd.array(attention_mask.astype("int32"), device=self.device)
         output = self.prefill_func(tokens_tvm, attention_mask_tvm, self.params)
         return output
+    
+    def embed_binary(self, queries: List[str]) -> tvm.runtime.NDArray:
+        """
+        Embeds a list of queries in a single batch then quantize to binary.
+
+        Parameters
+        ----------
+        queries : List[str]
+            A list of queries to embed.
+
+        Returns
+        -------
+        List[float]
+            A list of embeddings for the queries.
+        """
+        tokens, attention_mask = self._tokenize_queries(queries)
+        tokens_tvm = tvm.nd.array(tokens.astype("int32"), device=self.device)
+        attention_mask_tvm = tvm.nd.array(attention_mask.astype("int32"), device=self.device)
+        output = self.prefill_binary_func(tokens_tvm, attention_mask_tvm, self.params)
+        return output
+    
+    def quantize_embeddings(
+        self,
+        embeddings: tvm.runtime.NDArray,
+        precision: Literal["int8", "binary"],
+        ranges: tvm.runtime.NDArray = None,
+        calibration_embeddings: tvm.runtime.NDArray = None,
+    ) -> tvm.runtime.NDArray:
+        """
+        Quantize the embeddings either to int8 or binary with backend accelerated.
+
+        Parameters
+        ----------
+        emebddings: tvm.runtime.NDArray
+            The embeddings to be quantized, of shape (batch_size, hidden_size)
+        precision: string
+            Either "int8" or "binary".
+        ranges: tvm.runtime.NDArray
+            Min and max for int8 quantization of shape (2, hidden_size). `ranges[0,:]` is the min,
+            while `ranges[1,:]` is the max.
+        calibration_emebddings: tvm.runtime.NDArray
+            Used for int8 quantization to determine the min and max when `ranges` is not provided.
+
+        Returns
+        -------
+        Quantized `embeddings` in the original shape (batch_size, hidden_size).
+        """
+        if precision == "binary":
+            return self.quantize_embedding_binary_func(embeddings)
+        elif precision == "int8":
+            batch_size, hidden_size = embeddings.shape
+            if ranges is None:
+                # Either use `calibration_embeddings` or `embeddings` to create range
+                if calibration_embeddings is not None:
+                    assert calibration_embeddings.shape[1] == hidden_size
+                    calibration_np = calibration_embeddings.numpy()
+                else:
+                    # If neither provided, use `embeddings` to create range
+                    calibration_np = embeddings.numpy()
+                ranges = np.vstack((np.min(calibration_np, axis=0), np.max(calibration_np, axis=0)))
+                range_min = tvm.nd.array(ranges[0,:], device=self.device)
+                range_max = tvm.nd.array(ranges[1,:], device=self.device)
+                ranges = tvm.nd.array(ranges, device=self.device)
+            else:
+                range_min = tvm.nd.array(ranges[0,:], device=self.device)
+                range_max = tvm.nd.array(ranges[1,:], device=self.device)
+            assert range_min.shape == (hidden_size,)
+            assert range_max.shape == (hidden_size,)
+
+            return self.quantize_embeddings_int8_func(embeddings, range_min, range_max)
 
     def _tokenize_queries(self, queries: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         tokens = engine_utils.process_prompts(queries, self.tokenizer.encode)  # type: ignore
